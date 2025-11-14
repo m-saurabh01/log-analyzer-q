@@ -22,8 +22,8 @@ import pandas as pd
 from utils.preprocess import parse_log_file, build_tfidf_pipeline
 from utils.models import IsolationForestDetector, AutoencoderDetector
 from sklearn.metrics import precision_recall_fscore_support
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 import numpy as np
+
 
 from utils.visuals import (
     plot_anomaly_timeline,
@@ -574,16 +574,15 @@ elif view == "Anomaly Explorer":
             f"Model used: {model_used} | "
             f"Contamination: {st.session_state['contamination_used']}"
         )
-
         # ------------------------------------------------------------------
-        # METRICS: precision / recall / F1 / accuracy (+ counts)
+        # METRICS: precision / recall / F1 / FPR
         #
-        # Case 1: if you have a true label column:
-        #   - use df_result['label'] as ground truth (0 = normal, 1 = anomaly)
-        # Case 2: if no label column:
-        #   - derive pseudo-labels from log_level:
+        # Case 1: true labels available:
+        #   df_result['label'] is ground truth (0 = normal, 1 = anomaly)
+        # Case 2: no labels:
+        #   heuristic labels from log_level:
         #       ERROR / FATAL / CRITICAL -> 1 (anomaly)
-        #       everything else         -> 0 (normal)
+        #       everything else          -> 0 (normal)
         # ------------------------------------------------------------------
         st.markdown("#### Detection metrics")
 
@@ -599,42 +598,129 @@ elif view == "Anomaly Explorer":
         try:
             y_pred = df_result["anomaly"].astype(int)
 
-            # core metrics
-            precision, recall, f1, support = precision_recall_fscore_support(
-                y_true, y_pred, pos_label=1, average="binary"
+            # core metrics; zero_division=0 avoids warnings when no positives
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                y_true,
+                y_pred,
+                pos_label=1,
+                average="binary",
+                zero_division=0,
             )
 
-            # confusion matrix for accuracy and counts
-            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-            total = tp + tn + fp + fn
-            accuracy = (tp + tn) / total if total > 0 else np.nan
+            # derive confusion matrix components manually
+            tn = int(((y_true == 0) & (y_pred == 0)).sum())
+            fp = int(((y_true == 0) & (y_pred == 1)).sum())
+            fn = int(((y_true == 1) & (y_pred == 0)).sum())
+            tp = int(((y_true == 1) & (y_pred == 1)).sum())
+
+            # False Positive Rate = FP / (FP + TN)
+            denom = fp + tn
+            fpr = fp / denom if denom > 0 else np.nan
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Precision (anomaly)", f"{precision:.3f}")
             m2.metric("Recall (anomaly)", f"{recall:.3f}")
             m3.metric("F1-score (anomaly)", f"{f1:.3f}")
-            m4.metric("Accuracy", f"{accuracy:.3f}")
+            m4.metric("False positive rate", f"{fpr:.3f}" if not np.isnan(fpr) else "N/A")
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("True anomalies (y=1)", int(tp + fn))
-            c2.metric("True normals (y=0)", int(tn + fp))
-            c3.metric("Predicted anomalies", int(tp + fp))
-            c4.metric("Predicted normals", int(tn + fn))
+            # Show basic counts to understand why metrics might be zero
+            pos_labels = int((y_true == 1).sum())
+            pos_preds = int((y_pred == 1).sum())
 
-            if label_source == "ground_truth":
-                st.caption(
-                    "Metrics computed against **ground-truth labels** in the `label` column "
-                    "(1 = anomaly, 0 = normal)."
+            st.caption(
+                f"Label source: "
+                f"{'ground truth (label column)' if label_source == 'ground_truth' else 'heuristic from log_level'} "
+                f" · Positive labels (y=1): {pos_labels} · Predicted anomalies: {pos_preds}"
+            )
+
+            if pos_labels == 0:
+                st.info(
+                    "No positive labels (y=1) found. With the current labeling scheme, "
+                    "metrics will be zero or not meaningful. For heuristic mode, "
+                    "this means your logs have no ERROR/FATAL/CRITICAL entries."
                 )
-            else:
-                st.caption(
-                    "Metrics computed against **heuristic labels**: "
-                    "`ERROR` / `FATAL` / `CRITICAL` treated as anomalies (1), "
-                    "all other levels treated as normal (0)."
+            elif pos_preds == 0:
+                st.info(
+                    "The model did not flag any anomalies (all predictions are 0). "
+                    "Precision/recall/F1 are therefore 0. Consider increasing contamination "
+                    "or switching model."
                 )
 
         except Exception as e:
             st.warning(f"Could not compute metrics: {e}")
+
+
+        # ------------------------------------------------------------------
+        # METRICS: how well the model hits ERROR/FATAL/CRITICAL lines
+        #
+        # Definitions (heuristic, not ground truth):
+        #   - "Severe"     = log_level in {ERROR, FATAL, CRITICAL}
+        #   - "Anomaly"    = model prediction df_result["anomaly"] == 1
+        #
+        # Metrics:
+        #   - Error coverage     = severe lines that are flagged / all severe lines
+        #   - Severity focus     = flagged anomalies that are severe / all anomalies
+        #   - Severe events      = count of severe lines
+        #   - Anomalies flagged  = count of lines the model marked as anomaly
+        # ------------------------------------------------------------------
+        st.markdown("#### Severity Focus metrics")
+
+        severe_mask = df_result["log_level"].isin(["ERROR", "FATAL", "CRITICAL"])
+        anomaly_mask = df_result["anomaly"] == 1
+
+        severe_count = int(severe_mask.sum())
+        anomaly_count = int(anomaly_mask.sum())
+        severe_hit = int((severe_mask & anomaly_mask).sum())
+        severe_missed = severe_count - severe_hit
+        normal_flagged = int((~severe_mask & anomaly_mask).sum())
+
+        coverage = severe_hit / severe_count if severe_count > 0 else None
+        severity_focus = severe_hit / anomaly_count if anomaly_count > 0 else None
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Error coverage",
+            f"{coverage*100:.1f} %" if coverage is not None else "N/A",
+            help="Fraction of ERROR/FATAL/CRITICAL lines that the model flagged as anomalies.",
+        )
+        m2.metric(
+            "Severity focus",
+            f"{severity_focus*100:.1f} %" if severity_focus is not None else "N/A",
+            help="Fraction of flagged anomalies that are ERROR/FATAL/CRITICAL.",
+        )
+        m3.metric(
+            "Severe events",
+            severe_count,
+            help="Total lines with log_level in {ERROR, FATAL, CRITICAL}.",
+        )
+        m4.metric(
+            "Anomalies flagged",
+            anomaly_count,
+            help="Total lines the model marked as anomalies.",
+        )
+
+        st.caption(
+            "Heuristic evaluation only: 'severe' events are log lines with "
+            "`log_level` in {ERROR, FATAL, CRITICAL}. "
+            "Error coverage = how many of these the model catches. "
+            "Severity focus = how many of the model's anomalies are actually severe."
+        )
+
+        if severe_count == 0:
+            st.info(
+                "This file contains no ERROR/FATAL/CRITICAL entries, so coverage metrics "
+                "are not defined. The model may still flag unusual non-error patterns."
+            )
+        elif anomaly_count == 0:
+            st.info(
+                "The model did not flag any anomalies for this file. "
+                "Consider increasing the contamination level or switching model."
+            )
+        elif severe_hit == 0:
+            st.info(
+                "None of the severe lines were flagged as anomalies. "
+                "This means the model's notion of 'anomaly' is currently focusing on other patterns."
+            )
 
         st.markdown("---")
 
